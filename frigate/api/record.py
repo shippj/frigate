@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Body, Depends, Request
 from fastapi import Path as PathParam
 from fastapi.responses import JSONResponse
 from peewee import fn, operator
@@ -24,10 +24,11 @@ from frigate.api.defs.query.recordings_query_parameters import (
     MediaRecordingsSummaryQueryParams,
     RecordingsDeleteQueryParams,
 )
+from frigate.api.defs.request.recordings_body import RecordingsMergeBody
 from frigate.api.defs.response.generic_response import GenericResponse
 from frigate.api.defs.tags import Tags
 from frigate.const import RECORD_DIR
-from frigate.models import Event, Recordings
+from frigate.models import Event, Export, Previews, Recordings, ReviewSegment, Timeline
 from frigate.util.time import get_dst_transitions
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,129 @@ def get_recordings_storage_usage(request: Request):
             ) * 100
 
     return JSONResponse(content=camera_usages)
+
+
+@router.get(
+    "/recordings/storage/orphans", dependencies=[Depends(require_role(["admin"]))]
+)
+def get_orphaned_recordings_storage(request: Request):
+    """Return recordings stored for cameras that are not in the current config."""
+    current_cameras = set(request.app.frigate_config.cameras.keys())
+
+    orphaned_query = Recordings.select(
+        Recordings.camera,
+        fn.COUNT(Recordings.id).alias("recording_count"),
+        fn.SUM(Recordings.segment_size).alias("usage"),
+        fn.MIN(Recordings.start_time).alias("start_time"),
+        fn.MAX(Recordings.end_time).alias("end_time"),
+    ).where(Recordings.segment_size != 0)
+
+    if current_cameras:
+        orphaned_query = orphaned_query.where(~(Recordings.camera << current_cameras))
+
+    orphaned_cameras = orphaned_query.group_by(Recordings.camera).dicts()
+
+    orphaned = {}
+
+    for camera in orphaned_cameras:
+        camera_name = camera["camera"]
+        previews = [
+            {
+                "path": recording.path.replace("/media/frigate/", ""),
+                "start_time": recording.start_time,
+                "end_time": recording.end_time,
+            }
+            for recording in (
+                Recordings.select(
+                    Recordings.path,
+                    Recordings.start_time,
+                    Recordings.end_time,
+                )
+                .where(Recordings.camera == camera_name, Recordings.segment_size != 0)
+                .order_by(Recordings.start_time.desc())
+                .limit(3)
+                .namedtuples()
+            )
+        ]
+
+        orphaned[camera_name] = {
+            "usage": camera["usage"] or 0,
+            "recording_count": camera["recording_count"],
+            "start_time": camera["start_time"],
+            "end_time": camera["end_time"],
+            "previews": previews,
+        }
+
+    return JSONResponse(content=orphaned)
+
+
+@router.post(
+    "/recordings/storage/orphans/{camera_name}/merge",
+    dependencies=[Depends(require_role(["admin"]))],
+)
+def merge_orphaned_recordings(
+    request: Request,
+    camera_name: str = PathParam(..., description="Orphaned camera name"),
+    body: RecordingsMergeBody = Body(...),
+):
+    """Merge all recordings from an orphaned camera into a configured camera."""
+    current_cameras = set(request.app.frigate_config.cameras.keys())
+
+    if camera_name in current_cameras:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Camera is not orphaned"},
+        )
+
+    if body.target_camera not in current_cameras:
+        return JSONResponse(
+            status_code=400,
+            content={"success": False, "message": "Target camera does not exist"},
+        )
+
+    updated_recordings = (
+        Recordings.update(camera=body.target_camera)
+        .where(Recordings.camera == camera_name)
+        .execute()
+    )
+    updated_events = (
+        Event.update(camera=body.target_camera)
+        .where(Event.camera == camera_name)
+        .execute()
+    )
+    updated_exports = (
+        Export.update(camera=body.target_camera)
+        .where(Export.camera == camera_name)
+        .execute()
+    )
+    updated_previews = (
+        Previews.update(camera=body.target_camera)
+        .where(Previews.camera == camera_name)
+        .execute()
+    )
+    updated_reviews = (
+        ReviewSegment.update(camera=body.target_camera)
+        .where(ReviewSegment.camera == camera_name)
+        .execute()
+    )
+    updated_timeline = (
+        Timeline.update(camera=body.target_camera)
+        .where(Timeline.camera == camera_name)
+        .execute()
+    )
+
+    return JSONResponse(
+        content={
+            "success": True,
+            "message": "Recordings merged successfully",
+            "recordings": updated_recordings,
+            "events": updated_events,
+            "exports": updated_exports,
+            "previews": updated_previews,
+            "reviews": updated_reviews,
+            "timeline": updated_timeline,
+        }
+    )
 
 
 @router.get("/recordings/summary", dependencies=[Depends(allow_any_authenticated())])
