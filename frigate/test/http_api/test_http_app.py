@@ -4,14 +4,14 @@ import frigate.genai
 from frigate.config import GenAIProviderEnum
 from frigate.const import REDACTED_CREDENTIAL_SENTINEL
 from frigate.genai import GenAIClient
-from frigate.models import Event, Recordings, ReviewSegment
+from frigate.models import Event, Export, Previews, Recordings, ReviewSegment, Timeline
 from frigate.stats.emitter import StatsEmitter
 from frigate.test.http_api.base_http_test import AuthTestClient, BaseTestHttp
 
 
 class TestHttpApp(BaseTestHttp):
     def setUp(self):
-        super().setUp([Event, Recordings, ReviewSegment])
+        super().setUp([Event, Export, Previews, Recordings, ReviewSegment, Timeline])
         self.app = super().create_app()
 
     ####################################################################################################################
@@ -46,6 +46,61 @@ class TestHttpApp(BaseTestHttp):
             response = client.get("/recordings/storage")
             assert response.status_code == 200
             assert response.json()["front_door"]["usage_percent"] == 25.0
+
+    def test_orphaned_recordings_storage_and_merge(self):
+        Recordings.create(
+            id="orphan-recording",
+            camera="old_front_door",
+            path="/media/frigate/recordings/2026-01-01/00/old_front_door/segment.mp4",
+            start_time=1,
+            end_time=11,
+            duration=10,
+            motion=0,
+            objects=0,
+            segment_size=12.5,
+        )
+        Recordings.create(
+            id="current-recording",
+            camera="front_door",
+            path="/media/frigate/recordings/2026-01-01/00/front_door/segment.mp4",
+            start_time=1,
+            end_time=11,
+            duration=10,
+            motion=0,
+            objects=0,
+            segment_size=4.0,
+        )
+
+        app = super().create_app()
+
+        with AuthTestClient(app) as client:
+            response = client.get("/recordings/storage/orphans")
+            assert response.status_code == 200
+            response_json = response.json()
+            assert response_json["old_front_door"]["usage"] == 12.5
+            assert response_json["old_front_door"]["recording_count"] == 1
+            assert response_json["old_front_door"]["previews"][0]["path"] == (
+                "recordings/2026-01-01/00/old_front_door/segment.mp4"
+            )
+            assert "front_door" not in response_json
+
+            response = client.post(
+                "/recordings/storage/orphans/old_front_door/merge",
+                json={"target_camera": "front_door"},
+            )
+            assert response.status_code == 200
+            assert response.json()["recordings"] == 1
+            assert (
+                Recordings.select()
+                .where(Recordings.id == "orphan-recording")
+                .get()
+                .camera
+                == "front_door"
+            )
+
+            response = client.get("/recordings/storage/orphans")
+            assert response.status_code == 200
+            assert response.json() == {}
 
     def test_config_set_in_memory_replaces_objects_track_list(self):
         self.minimal_config["cameras"]["front_door"]["objects"] = {

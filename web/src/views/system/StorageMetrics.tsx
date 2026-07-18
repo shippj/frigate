@@ -1,7 +1,7 @@
 import { CombinedStorageGraph } from "@/components/graph/CombinedStorageGraph";
 import { StorageGraph } from "@/components/graph/StorageGraph";
 import { FrigateStats } from "@/types/stats";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Popover,
   PopoverContent,
@@ -23,6 +23,31 @@ import { useDocDomain } from "@/hooks/use-doc-domain";
 import { LuExternalLink } from "react-icons/lu";
 import { FaExclamationTriangle } from "react-icons/fa";
 import ActivityIndicator from "@/components/indicators/activity-indicator";
+import { Button } from "@/components/ui/button";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { getUnitSize } from "@/utils/storageUtil";
+import { baseUrl } from "@/api/baseUrl";
+import axios from "axios";
+
+type OrphanedCameraStorage = {
+  [key: string]: {
+    usage: number;
+    recording_count: number;
+    start_time: number;
+    end_time: number;
+    previews: {
+      path: string;
+      start_time: number;
+      end_time: number;
+    }[];
+  };
+};
 
 type CameraStorage = {
   [key: string]: {
@@ -38,7 +63,12 @@ type StorageMetricsProps = {
 export default function StorageMetrics({
   setLastUpdated,
 }: StorageMetricsProps) {
-  const { data: cameraStorage } = useSWR<CameraStorage>("recordings/storage");
+  const { data: cameraStorage, mutate: refreshCameraStorage } =
+    useSWR<CameraStorage>("recordings/storage");
+  const { data: orphanedCameraStorage, mutate: refreshOrphanedStorage } =
+    useSWR<OrphanedCameraStorage>("recordings/storage/orphans");
+  const [mergeTargets, setMergeTargets] = useState<Record<string, string>>({});
+  const [mergingCamera, setMergingCamera] = useState<string>();
   const { data: stats } = useSWR<FrigateStats>("stats");
   const { data: config } = useSWR<FrigateConfig>("config", {
     revalidateOnFocus: false,
@@ -128,7 +158,47 @@ export default function StorageMetrics({
     };
   }, [stats, config]);
 
-  if (!cameraStorage || !stats || !totalStorage || !config) {
+  const configuredCameras = useMemo(
+    () => Object.keys(config?.cameras ?? {}),
+    [config],
+  );
+
+  const orphanedEntries = useMemo(
+    () =>
+      Object.entries(orphanedCameraStorage ?? {}).sort(
+        (a, b) => b[1].usage - a[1].usage,
+      ),
+    [orphanedCameraStorage],
+  );
+
+  const mergeOrphanedCamera = async (camera: string) => {
+    const targetCamera = mergeTargets[camera] ?? configuredCameras[0];
+
+    if (!targetCamera) {
+      return;
+    }
+
+    setMergingCamera(camera);
+    try {
+      await axios.post(
+        `recordings/storage/orphans/${encodeURIComponent(camera)}/merge`,
+        {
+          target_camera: targetCamera,
+        },
+      );
+      await Promise.all([refreshOrphanedStorage(), refreshCameraStorage()]);
+    } finally {
+      setMergingCamera(undefined);
+    }
+  };
+
+  if (
+    !cameraStorage ||
+    !stats ||
+    !totalStorage ||
+    !config ||
+    !orphanedCameraStorage
+  ) {
     return (
       <div className="flex size-full items-center justify-center">
         <ActivityIndicator />
@@ -271,6 +341,84 @@ export default function StorageMetrics({
           totalStorage={totalStorage}
         />
       </div>
+      {orphanedEntries.length > 0 && (
+        <>
+          <div className="mt-4 text-sm font-medium text-muted-foreground">
+            {t("storage.orphanedCameras.title")}
+          </div>
+          <div className="mt-4 space-y-3">
+            {orphanedEntries.map(([camera, storage]) => (
+              <div
+                key={camera}
+                className="rounded-lg bg-background_alt p-2.5 md:rounded-2xl"
+              >
+                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                  <div>
+                    <div className="text-sm font-medium">
+                      {camera.replaceAll("_", " ")}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t("storage.orphanedCameras.details", {
+                        storage: getUnitSize(storage.usage),
+                        count: storage.recording_count,
+                      })}
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <Select
+                      value={mergeTargets[camera] ?? configuredCameras[0]}
+                      onValueChange={(value) =>
+                        setMergeTargets((prev) => ({
+                          ...prev,
+                          [camera]: value,
+                        }))
+                      }
+                    >
+                      <SelectTrigger className="w-full sm:w-[180px]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {configuredCameras.map((configuredCamera) => (
+                          <SelectItem
+                            key={configuredCamera}
+                            value={configuredCamera}
+                          >
+                            {configuredCamera.replaceAll("_", " ")}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Button
+                      size="sm"
+                      onClick={() => mergeOrphanedCamera(camera)}
+                      disabled={
+                        !configuredCameras.length || mergingCamera === camera
+                      }
+                    >
+                      {mergingCamera === camera
+                        ? t("storage.orphanedCameras.merging")
+                        : t("storage.orphanedCameras.merge")}
+                    </Button>
+                  </div>
+                </div>
+                {storage.previews.length > 0 && (
+                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    {storage.previews.map((preview) => (
+                      <video
+                        key={preview.path}
+                        className="aspect-video w-full rounded-md bg-black object-cover"
+                        src={`${baseUrl}${preview.path}`}
+                        controls
+                        preload="metadata"
+                      />
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }

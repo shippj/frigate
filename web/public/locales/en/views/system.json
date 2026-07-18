@@ -154,6 +154,12 @@
         "title": "Unused",
         "tips": "This value may not accurately represent the free space available to Frigate if you have other files stored on your drive beyond Frigate's recordings. Frigate does not track storage usage outside of its recordings."
       }
+    },
+    "orphanedCameras": {
+      "title": "Orphaned Cameras",
+      "details": "{{storage}} across {{count}} recordings",
+      "merge": "Merge recordings",
+      "merging": "Merging..."
     }
   },
   "cameras": {
